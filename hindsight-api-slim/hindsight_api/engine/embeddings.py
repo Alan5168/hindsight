@@ -1116,11 +1116,24 @@ class OpenAIEmbeddings(Embeddings):
         elif self.model in self.MODEL_DIMENSIONS:
             self._dimension = self.MODEL_DIMENSIONS[self.model]
         else:
-            # Do a test embedding to detect dimension
+            # Do a test embedding to detect dimension. This probe runs from
+            # MemoryEngine.initialize() inside the lifespan TaskGroup, so a transient
+            # 429 (e.g. the endpoint is busy serving a benchmark load) used to escape
+            # and exit the process with "Application startup failed" (#6709). Retry it
+            # with the same bounded policy the knowledge embedder uses for ingest;
+            # permanent errors (401/400/...) still fail fast, and an endpoint still
+            # rate-limited after the budget still fails startup rather than hanging it.
             request: dict[str, Any] = {"model": self.model, "input": ["test"]}
             if self.extra_body:
                 request["extra_body"] = self.extra_body
-            response = await self._loop_client().embeddings.create(**request)
+
+            async def _probe() -> Any:
+                return await self._loop_client().embeddings.create(**request)
+
+            policy = RetryPolicy(max_retries=5, budget_seconds=60.0)
+            response = await acall_with_retry(
+                _probe, policy=policy, budget=policy.new_budget(), provider=f"{self.provider_name}-embeddings-startup"
+            )
             if response.data:
                 self._dimension = len(response.data[0].embedding)
 
