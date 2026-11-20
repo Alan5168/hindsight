@@ -343,3 +343,85 @@ class TestRouterCall:
         )
         kwargs = mock_router.acompletion.await_args.kwargs
         assert kwargs["max_completion_tokens"] == 64000
+
+
+# --- resolved model name (metrics / llm_requests) -----------------------------
+
+
+class TestResolveCompletionModel:
+    """#6690: the recorded model must name the deployment that answered, not the
+    ``default`` entrypoint group. Router responses carry no ``model`` key in
+    ``_hidden_params``; LiteLLM reports ``provider_response_model`` (>= 1.108)
+    and ``litellm_model_name`` (>= 1.95.1, the dependency floor)."""
+
+    def test_provider_response_model_wins(self, two_step_config):
+        provider = _make_router_provider(two_step_config, MagicMock())
+        response = SimpleNamespace(
+            _hidden_params={
+                "provider_response_model": "glm-5.3-flash",
+                "litellm_model_name": "openai/glm-5.3-flash",
+            }
+        )
+        assert provider._resolve_completion_model(response) == "glm-5.3-flash"
+
+    def test_litellm_model_name_used_on_older_litellm(self, two_step_config):
+        # litellm < 1.108 (e.g. the locked 1.104.0) only sets litellm_model_name.
+        provider = _make_router_provider(two_step_config, MagicMock())
+        response = SimpleNamespace(_hidden_params={"litellm_model_name": "openai/gpt-4o-mini"})
+        assert provider._resolve_completion_model(response) == "openai/gpt-4o-mini"
+
+    def test_router_shaped_hidden_params_without_model_key(self, two_step_config):
+        # The real Router response shape: no "model" key at all. Reading only
+        # "model" recorded every call — including fallbacks — as "default".
+        provider = _make_router_provider(two_step_config, MagicMock())
+        response = SimpleNamespace(
+            _hidden_params={
+                "litellm_call_id": "call-123",
+                "api_base": "https://api.minimax.io/v1",
+                "model_id": "deployment-abc",
+                "response_cost": 0.001,
+                "litellm_model_name": "openai/MiniMax-M3",
+            }
+        )
+        assert provider._resolve_completion_model(response) == "openai/MiniMax-M3"
+
+    def test_empty_hidden_params_falls_back_to_entrypoint(self, two_step_config):
+        provider = _make_router_provider(two_step_config, MagicMock())
+        response = SimpleNamespace(_hidden_params={})
+        assert provider._resolve_completion_model(response) == "default"
+
+    def test_missing_hidden_params_falls_back_to_entrypoint(self, two_step_config):
+        provider = _make_router_provider(two_step_config, MagicMock())
+        response = SimpleNamespace()
+        assert provider._resolve_completion_model(response) == "default"
+
+    @pytest.mark.asyncio
+    async def test_call_records_answering_deployment_in_metrics_and_span(self, two_step_config):
+        """End to end: a fallback deployment answers, and both the metrics
+        collector (llm_requests.model) and the trace span name it, not 'default'."""
+        response = MagicMock()
+        choice = MagicMock()
+        choice.message.content = "ok"
+        choice.message.tool_calls = None
+        choice.finish_reason = "stop"
+        response.choices = [choice]
+        response.usage = _usage(12, 3)
+        response._hidden_params = {"litellm_model_name": "openai/gpt-4o-mini"}
+
+        mock_router = MagicMock()
+        mock_router.acompletion = AsyncMock(return_value=response)
+        provider = _make_router_provider(two_step_config, mock_router)
+
+        metrics = MagicMock()
+        spans = MagicMock()
+        with (
+            patch(
+                "hindsight_api.engine.providers.litellm_llm.get_metrics_collector",
+                return_value=metrics,
+            ),
+            patch("hindsight_api.tracing.get_span_recorder", return_value=spans),
+        ):
+            await provider.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+        assert metrics.record_llm_call.call_args.kwargs["model"] == "openai/gpt-4o-mini"
+        assert spans.record_llm_call.call_args.kwargs["model"] == "openai/gpt-4o-mini"

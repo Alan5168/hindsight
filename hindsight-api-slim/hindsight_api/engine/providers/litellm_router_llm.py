@@ -124,8 +124,15 @@ class LiteLLMRouterLLM(LiteLLMLLM):
         return await self._router.acompletion(**kwargs)
 
     def _resolve_completion_model(self, response: Any) -> str:
+        # Router responses carry no "model" key in _hidden_params, so reading it
+        # recorded every call as the "default" entrypoint group — hiding which
+        # deployment (primary or fallback) actually answered (#6690). LiteLLM
+        # reports the provider's own model name in "provider_response_model"
+        # (>= 1.108) and the configured deployment model in "litellm_model_name"
+        # (>= 1.95.1, our floor); prefer the former, keep the entrypoint name
+        # only as a last resort. Both dict and HiddenParams expose .get().
         hidden = getattr(response, "_hidden_params", None) or {}
-        return hidden.get("model") or _ENTRYPOINT_MODEL_NAME
+        return hidden.get("provider_response_model") or hidden.get("litellm_model_name") or _ENTRYPOINT_MODEL_NAME
 
     def _get_model_output_cap(self) -> int | None:
         return self._router_output_cap
